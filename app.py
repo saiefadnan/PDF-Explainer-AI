@@ -1,7 +1,6 @@
 from functions import extract_text_from_pdfs, preprocess_text
-from functions import chunk_text_by_token, get_tokenizer_and_max_len
-from functions import  load_qa_model, get_summaries_for_chunks, download_nltk_resources
-from transformers import pipeline
+from functions import chunk_text_by_token, get_tokenizer_and_max_len, query_pinecone_for_context
+from functions import load_summarizer_model, load_qa_model, get_summaries_for_chunks, download_nltk_resources, get_expanded_answer, generate_summary_pdf
 import streamlit as st
 
 st.set_page_config(page_title="PDF Summarizer AI", layout="wide")
@@ -9,11 +8,19 @@ st.set_page_config(page_title="PDF Summarizer AI", layout="wide")
 # Download NLTK resources after page config
 download_nltk_resources()
 qa_pipeline = load_qa_model()
+summarizer = load_summarizer_model()
+tokenizer, max_len = get_tokenizer_and_max_len()
 
 st.title("PDF Summarizer AI")
 st.markdown("Upload a PDF file, and this app will extract the text, chunk it, and generate summaries for each chunk using a pre-trained AI model.")
 if "preprocessed_text" not in st.session_state:
     st.session_state.preprocessed_text = ""
+if "chunk_summaries" not in st.session_state:
+    st.session_state.chunk_summaries = []
+if "final_summary" not in st.session_state:
+    st.session_state.final_summary = ""
+if "pdf_filename" not in st.session_state:
+    st.session_state.pdf_filename = ""
 
 st.sidebar.header("Configuration")
 # desired_chunk_size = st.sidebar.number_input("Chunk Size (characters)", min_value=200, max_value=2000, value=700, step=50)
@@ -26,6 +33,7 @@ st.sidebar.markdown("Developed with ❤️ using Streamlit & Hugging Face")
 uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
 
 if uploaded_file is not None:
+    st.session_state.pdf_filename = uploaded_file.name
     with st.spinner('Extracting text from PDF...'):
         extracted_text = extract_text_from_pdfs(uploaded_file)
     if extracted_text: 
@@ -38,7 +46,6 @@ if uploaded_file is not None:
         if st.session_state.preprocessed_text:
             st.subheader("2. Chunking Text...")
             with st.spinner('Chunking text...'):
-                tokenizer, max_len = get_tokenizer_and_max_len()
                 text_chunks = chunk_text_by_token(
                                         text=st.session_state.preprocessed_text, 
                                         _tokenizer=tokenizer,
@@ -50,12 +57,12 @@ if uploaded_file is not None:
             if text_chunks:
                 st.subheader("3. Generating Summaries for Each Chunk...")
                 with st.expander("Summarizing..."):
-                    chunk_summaries = get_summaries_for_chunks(text_chunks,
-                                                            
-                                                            min_summary_length,
-                                                            max_summary_length)
-            
-            
+                    chunk_summaries = get_summaries_for_chunks(
+                        summarizer, 
+                        text_chunks,
+                        min_summary_length,
+                        max_summary_length) 
+                st.session_state.chunk_summaries = chunk_summaries
                 st.markdown("---")
                 st.subheader("Chunk Summaries")
                 for i, summary in enumerate(chunk_summaries):
@@ -72,27 +79,61 @@ if uploaded_file is not None:
                         try:
                             # Generate a summary of all the chunk summaries combined
                             with st.spinner('Generating concise overall summary...'):
-                                concise_summary_list = get_summaries_for_chunks([full_doc_summary], 
-                                                                            min_summary_length, 
-                                                                            max_summary_length)
+                                concise_summary_list = get_summaries_for_chunks(
+                                    summarizer,
+                                    [full_doc_summary],
+                                    min_summary_length,
+                                    max_summary_length
+                                )
                             # Extract the actual summary text from the list
                             if concise_summary_list and len(concise_summary_list) > 0:
                                 final_summary = concise_summary_list[0]
                                 # Clean up any "Summary unavailable" prefixes
                                 if final_summary.startswith("Summary unavailable. Preview: "):
                                     final_summary = final_summary.replace("Summary unavailable. Preview: ", "")
+                                st.session_state.final_summary = final_summary
                                 st.success("**Final Document Summary:**")
                                 st.info(final_summary)
                             else:
+                                st.session_state.final_summary = full_doc_summary
                                 st.warning("Could not generate a concise summary. Here's the combined summary:")
                                 st.write(full_doc_summary)
                         except Exception as e:
+                            st.session_state.final_summary = full_doc_summary
                             st.error(f"Error generating concise overall summary: {e}")
                             st.warning("Showing combined chunk summaries instead:")
                             st.write(full_doc_summary)
                     else:
+                        st.session_state.final_summary = full_doc_summary
                         st.success("**Final Document Summary:**")
                         st.write(full_doc_summary)
+
+                    # ── Download Summary PDF Button ───────────────────────────
+                    if st.session_state.final_summary and st.session_state.chunk_summaries:
+                        st.markdown("---")
+                        st.markdown("### 📥 Download Summary Report")
+                        st.markdown(
+                            "<p style='color:#555;font-size:14px;margin-top:-8px'>"
+                            "Download a beautifully formatted PDF containing all section summaries "
+                            "and the final document summary.</p>",
+                            unsafe_allow_html=True,
+                        )
+                        with st.spinner("Preparing PDF..."):
+                            pdf_bytes = generate_summary_pdf(
+                                chunk_summaries=st.session_state.chunk_summaries,
+                                final_summary=st.session_state.final_summary,
+                                pdf_filename=st.session_state.pdf_filename,
+                            )
+                        fname = st.session_state.pdf_filename.replace(".pdf", "") or "document"
+                        download_name = f"{fname}_summary.pdf"
+                        st.download_button(
+                            label="⬇️  Download Summary PDF",
+                            data=pdf_bytes,
+                            file_name=download_name,
+                            mime="application/pdf",
+                            use_container_width=True,
+                            type="primary",
+                        )
                 else:
                     st.info("No chunk summaries were generated.")
             else:
@@ -145,19 +186,14 @@ if context:
     if user_input and user_input.strip():
         with st.spinner('🤔 Thinking...'):
             try:
-                # Get answer from QA model
-                result = qa_pipeline({"question": user_input, "context": context})
-                answer = result["answer"]
+                # Step 1: Get relevant context from Pinecone
+                relevant_context = query_pinecone_for_context(user_input, top_k=3)
                 
-                # Add confidence score if available
-                confidence = result.get("score", 0)
-                if confidence < 0.3:
-                    answer += f" *(Low confidence: {confidence:.2f})*"
+                # Step 2: Get expanded answer (short span + detailed explanation)
+                answer, confidence = get_expanded_answer(user_input, relevant_context)
                 
                 # Add to chat history
                 st.session_state.chat_history.append((user_input, answer))
-                
-                # Auto-rerun to show new message
                 st.rerun()
                 
             except Exception as e:
