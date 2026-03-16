@@ -21,7 +21,7 @@ model_name = "facebook/bart-large-cnn"  # 📈 Better quality, 3x larger
 # model_name = "sshleifer/distilbart-cnn-12-6"  # 🏃‍♂️ Current (fast)
 # model_name = "google/pegasus-xsum"  # 📰 Great for short summaries
 # model_name = "microsoft/DialoGPT-medium"  # 💬 Conversational summaries
-qa_model_name = "google/flan-t5-base"  # 🎯 Generates full explained answers, free & deployable
+qa_model_name = "google/flan-t5-large"  # Larger model for better, longer answers
 # qa_model_name = "google/flan-t5-large"  # 📈 Better quality, slower
 # qa_model_name = "deepset/roberta-base-squad2"  # 🏃 Fast but short span answers only
 
@@ -135,31 +135,44 @@ def query_pinecone_for_context(user_qus, top_k=3):
         include_metadata=True
     )
 
-    # Extract the chunk text from metadata
+    # Extract the chunk text from metadata and clean it
     context_chunks = [match['metadata']['text'] for match in query_response['matches']]
-    return " ".join(context_chunks)
+    
+    # Clean the context: remove URLs, extra whitespace, and formatting
+    cleaned_chunks = []
+    for chunk in context_chunks:
+        # Remove URLs
+        chunk = re.sub(r'https?://\S+', '', chunk)
+        chunk = re.sub(r'www\.\S+', '', chunk)
+        # Remove multiple spaces
+        chunk = re.sub(r'\s+', ' ', chunk).strip()
+        if chunk:  # Only add non-empty chunks
+            cleaned_chunks.append(chunk)
+    
+    return " ".join(cleaned_chunks)
 
 def get_expanded_answer(question, relevant_context):
     """
-    Uses flan-t5 to generate a clean answer from the relevant context.
+    Uses flan-t5 to generate a detailed, expanded answer from the relevant context.
     """
     qa_pipeline = load_qa_model()
 
-    # Truncate context to avoid repetition issues
+    # Provide more context for better answers
     context_words = relevant_context.split()
-    if len(context_words) > 300:
-        relevant_context = " ".join(context_words[:300])
+    if len(context_words) > 500:  # Increased from 300 to 500
+        relevant_context = " ".join(context_words[:500])
 
     # Clear and direct prompt - less hallucination
-    prompt = f"Answer the question using only the context below. Be concise and direct.\n\nContext: {relevant_context}\n\nQuestion: {question}\n\nAnswer:"
+    prompt = f"Answer the question using only the context below. Be thorough and detailed.\n\nContext: {relevant_context}\n\nQuestion: {question}\n\nAnswer:"
 
     try:
         result = qa_pipeline(
             prompt,
-            max_new_tokens=120,       # Limit length to prevent repetition
+            max_new_tokens=300,       # Increased for much longer answers
+            min_new_tokens=50,        # Force minimum length
             do_sample=False,
-            no_repeat_ngram_size=4,   # Prevent repeating 4-gram phrases
-            repetition_penalty=2.5,   # Penalize repetition heavily
+            no_repeat_ngram_size=3,   # Prevent repeating 3-gram phrases
+            repetition_penalty=2.0,   # Penalize repetition
             early_stopping=True,
             num_beams=4               # Beam search for better quality
         )
@@ -168,6 +181,12 @@ def get_expanded_answer(question, relevant_context):
         # Remove the prompt if it's included in the output
         if "Answer:" in answer:
             answer = answer.split("Answer:")[-1].strip()
+
+        # Clean URLs and metadata artifacts from the answer
+        answer = re.sub(r'https?://\S+', '', answer)
+        answer = re.sub(r'www\.\S+', '', answer)
+        answer = re.sub(r'\(\s*Methodological Reference\s*\)', '', answer)
+        answer = re.sub(r'\s+', ' ', answer).strip()
 
         if not answer or len(answer.split()) < 3:
             answer = "I could not find a relevant answer in the document for this question."
@@ -234,113 +253,75 @@ def get_summaries_for_chunks(summarizer, text_chunks,  min_summary_length=50, ma
 
 def generate_summary_pdf(chunk_summaries, final_summary, pdf_filename="summary"):
     """
-    Generates a styled PDF containing chunk summaries and the final document summary.
+    Generates a clean, simplified PDF with section summaries first, then final summary.
     Returns the PDF as bytes for Streamlit download.
     """
 
     class SummaryPDF(FPDF):
         def header(self):
-            # Background header bar
-            self.set_fill_color(30, 90, 180)          # deep blue
-            self.rect(0, 0, 210, 22, "F")
-            self.set_font("Helvetica", "B", 14)
+            # Simple header bar
+            self.set_fill_color(30, 90, 180)
+            self.rect(0, 0, 210, 18, "F")
+            self.set_font("Helvetica", "B", 13)
             self.set_text_color(255, 255, 255)
             self.set_xy(10, 5)
-            self.cell(0, 12, "PDF Explainer AI  -  Summary Report", align="L")
-            # Date on the right
-            self.set_font("Helvetica", "", 9)
-            date_str = datetime.now().strftime("%B %d, %Y")
-            self.set_xy(0, 8)
-            self.cell(200, 8, date_str, align="R")
+            self.cell(0, 8, "PDF Explainer AI - Summary Report", align="L")
             self.set_text_color(0, 0, 0)
-            self.ln(20)
+            self.ln(18)
 
         def footer(self):
-            self.set_y(-14)
-            self.set_fill_color(30, 90, 180)
-            self.rect(0, self.get_y(), 210, 14, "F")
+            self.set_y(-10)
             self.set_font("Helvetica", "I", 8)
-            self.set_text_color(200, 220, 255)
-            self.cell(0, 14, f"Page {self.page_no()}  |  Generated by PDF Explainer AI", align="C")
+            self.set_text_color(128, 128, 128)
+            self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
     pdf = SummaryPDF()
-    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.set_margins(15, 28, 15)
+    pdf.set_margins(12, 22, 12)
 
-    # ── Helper to safely encode text for latin-1 ──────────────────────────────
+    # Helper to safely encode text for latin-1
     def safe(text):
         return text.encode("latin-1", errors="replace").decode("latin-1")
 
-    # ── Source file name banner ───────────────────────────────────────────────
-    name = pdf_filename if pdf_filename else "Uploaded Document"
-    pdf.set_fill_color(235, 242, 255)
-    pdf.set_draw_color(30, 90, 180)
-    pdf.set_font("Helvetica", "B", 10)
+    # Document title and source
+    pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(30, 90, 180)
-    pdf.cell(0, 9, safe(f"  Source: {name}"), border="B", fill=True, ln=True)
-    pdf.ln(4)
-
-    # ── Final Document Summary ────────────────────────────────────────────────
-    pdf.set_fill_color(30, 90, 180)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 9, "  Overall Document Summary", fill=True, ln=True)
-    pdf.ln(2)
-
-    pdf.set_fill_color(240, 245, 255)
-    pdf.set_draw_color(30, 90, 180)
-    pdf.set_text_color(20, 20, 20)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_line_width(0.5)
-    # Draw left accent bar
-    x, y = pdf.get_x(), pdf.get_y()
-    pdf.set_fill_color(240, 245, 255)
-    pdf.multi_cell(0, 6, safe(final_summary), border=0, fill=True)
-    # Draw left blue accent line
-    pdf.set_draw_color(30, 90, 180)
-    pdf.set_line_width(1.2)
-    pdf.line(15, y, 15, pdf.get_y())
-    pdf.set_line_width(0.2)
-    pdf.ln(5)
-
-    # ── Divider ───────────────────────────────────────────────────────────────
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-    pdf.ln(5)
-
-    # ── Chunk Summaries ───────────────────────────────────────────────────────
-    pdf.set_fill_color(30, 90, 180)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 9, f"  Section Summaries  ({len(chunk_summaries)} sections)", fill=True, ln=True)
+    name = pdf_filename.replace(".pdf", "") if pdf_filename else "Document"
+    pdf.cell(0, 8, safe(f"Source: {name}"), ln=True)
     pdf.ln(3)
 
+    # ---- Section Summaries ----
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_fill_color(30, 90, 180)
+    pdf.cell(0, 7, "  SECTION SUMMARIES", fill=True, ln=True)
+    pdf.ln(4)
+
     for i, summary in enumerate(chunk_summaries):
-        # Section number badge
-        pdf.set_fill_color(30, 90, 180)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(28, 7, f"  Section {i + 1}", fill=True)
+        # Section number
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(30, 90, 180)
+        pdf.cell(0, 6, f"Section {i + 1}", ln=True)
+        
+        # Summary text
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(0, 0, 0)
+        pdf.multi_cell(0, 5, safe(summary), ln=True)
+        pdf.ln(2)
 
-        # Section title line (light blue bg)
-        pdf.set_fill_color(210, 225, 255)
-        pdf.set_text_color(30, 30, 30)
-        pdf.set_font("Helvetica", "I", 9)
-        pdf.cell(0, 7, f"  Chunk {i + 1} of {len(chunk_summaries)}", fill=True, ln=True)
+    # ---- Final Summary ----
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_fill_color(30, 90, 180)
+    pdf.cell(0, 7, "  FINAL SUMMARY", fill=True, ln=True)
+    pdf.ln(4)
 
-        # Summary text box
-        pdf.set_fill_color(250, 250, 252)
-        pdf.set_draw_color(200, 210, 230)
-        pdf.set_text_color(30, 30, 30)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_line_width(0.3)
-        pdf.multi_cell(0, 6, safe(summary), border=1, fill=True)
-        pdf.ln(4)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(0, 0, 0)
+    pdf.multi_cell(0, 5, safe(final_summary), ln=True)
 
-    # ── Back-cover footer strip ────────────────────────────────────────────────
-    # (handled by the footer() method automatically)
-
-    # ── Return bytes ──────────────────────────────────────────────────────────
+    # Return PDF as bytes
     pdf_bytes = bytes(pdf.output())
     return pdf_bytes
