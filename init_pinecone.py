@@ -1,12 +1,13 @@
-import os
+import streamlit as st
 from pinecone import Pinecone, ServerlessSpec
-from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
+# Get API keys from Streamlit secrets (works on Cloud and local with secrets.toml)
+PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", "")
+PINECONE_ENV = st.secrets.get("PINECONE_ENV", "us-east-1-aws")
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENV = os.getenv("PINECONE_ENV")
+if not PINECONE_API_KEY:
+    st.error("❌ PINECONE_API_KEY not found in secrets!")
+    st.stop()
 
 # Create a Pinecone client instance
 pc = Pinecone(api_key=PINECONE_API_KEY)

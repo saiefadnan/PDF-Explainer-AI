@@ -1,37 +1,29 @@
+import os
 from functions import extract_text_from_pdfs, preprocess_text
 from functions import chunk_text_by_token, get_tokenizer_and_max_len, query_pinecone_for_context
-from functions import load_summarizer_model, load_qa_model, get_summaries_for_chunks, download_nltk_resources, get_expanded_answer, generate_summary_pdf
+from functions import download_nltk_resources, get_expanded_answer, generate_summary_pdf, get_summaries_for_chunks
+from functions import validate_api_keys
 import streamlit as st
 
 st.set_page_config(page_title="PDF Summarizer AI", layout="wide")
 
+# Validate API keys before proceeding
+validate_api_keys()
+
 # Download NLTK resources after page config
 download_nltk_resources()
 
-# Initialize session state for models to avoid reloading
-# Add a model version key to force reload when models change
-MODEL_VERSION = "flan-t5-large-v1"  # Increment this to force model reload
-
-if "model_version" not in st.session_state or st.session_state.model_version != MODEL_VERSION:
-    st.session_state.model_version = MODEL_VERSION
-    st.session_state.qa_pipeline = load_qa_model()
-    st.session_state.summarizer = load_summarizer_model()
-    st.session_state.tokenizer, st.session_state.max_len = get_tokenizer_and_max_len()
-elif "qa_pipeline" not in st.session_state:
-    st.session_state.qa_pipeline = load_qa_model()
-    
-if "summarizer" not in st.session_state:
-    st.session_state.summarizer = load_summarizer_model()
+# Initialize tokenizer only once
 if "tokenizer" not in st.session_state:
     st.session_state.tokenizer, st.session_state.max_len = get_tokenizer_and_max_len()
 
-qa_pipeline = st.session_state.qa_pipeline
-summarizer = st.session_state.summarizer
 tokenizer = st.session_state.tokenizer
 max_len = st.session_state.max_len
 
 st.title("PDF Summarizer AI")
 st.markdown("Upload a PDF file, and this app will extract the text, chunk it, and generate summaries for each chunk using a pre-trained AI model.")
+
+# Initialize session state variables
 if "preprocessed_text" not in st.session_state:
     st.session_state.preprocessed_text = ""
 if "chunk_summaries" not in st.session_state:
@@ -40,17 +32,17 @@ if "final_summary" not in st.session_state:
     st.session_state.final_summary = ""
 if "pdf_filename" not in st.session_state:
     st.session_state.pdf_filename = ""
+if "processing_done" not in st.session_state:
+    st.session_state.processing_done = False
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 st.sidebar.header("Configuration")
-# desired_chunk_size = st.sidebar.number_input("Chunk Size (characters)", min_value=200, max_value=2000, value=700, step=50)
 chunk_overlap_token_size = st.sidebar.number_input("Chunk Overlap Size (tokens)", min_value=40, max_value=300, value=40, step=10)
 min_summary_length = st.sidebar.number_input("Minimum Summary Length (words)", min_value=5, max_value=100, value=10, step=5)
 max_summary_length = st.sidebar.number_input("Maximum Summary Length (words)", min_value=10, max_value=1000, value=500, step=5)
 st.sidebar.markdown("---")
 st.sidebar.markdown("Developed with ❤️ using Streamlit & Hugging Face")
-
-if "processing_done" not in st.session_state:
-    st.session_state.processing_done = False
 
 uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
 
@@ -62,128 +54,158 @@ if uploaded_file is not None:
         st.session_state.chunk_summaries = []
         st.session_state.final_summary = ""
         st.session_state.preprocessed_text = ""
+        st.session_state.chat_history = []
     
     # Only process if not already done
     if not st.session_state.processing_done:
         st.session_state.pdf_filename = uploaded_file.name
+        
         with st.spinner('Extracting text from PDF...'):
-            extracted_text = extract_text_from_pdfs(uploaded_file)
-        if extracted_text: 
-            st.success("Text extraction successful.")
-            st.subheader("1. Preprocessing Text...")
-            with st.spinner('Preprocessing text...'):
-                st.session_state.preprocessed_text = preprocess_text(extracted_text)
-            st.write(f"Original text length: {len(extracted_text)} characters.")
-            st.write(f"Preprocessed text length: {len(st.session_state.preprocessed_text)} characters.")
-            if st.session_state.preprocessed_text:
-                st.subheader("2. Chunking Text...")
-                with st.spinner('Chunking text...'):
-                    text_chunks = chunk_text_by_token(
-                                            text=st.session_state.preprocessed_text, 
-                                            _tokenizer=tokenizer,
-                                            max_len=max_len,
-                                            reserve_space= 128,
-                                            overlap_tokens=chunk_overlap_token_size)
-                st.write(f"Number of text chunks created: {len(text_chunks)}")
+            try:
+                pdf_bytes = uploaded_file.read()
+                extracted_text = extract_text_from_pdfs(pdf_bytes)
+            except Exception as e:
+                st.error(f"Failed to extract text from PDF: {str(e)}")
+                st.stop()
+        
+        if not extracted_text or len(extracted_text.strip()) == 0:
+            st.error("No text could be extracted from this PDF. The file might be empty or contain only images.")
+            st.stop()
+            
+        st.success("Text extraction successful.")
+        st.subheader("1. Preprocessing Text...")
+        
+        with st.spinner('Preprocessing text...'):
+            preprocessed_text = preprocess_text(extracted_text)
+            st.session_state.preprocessed_text = preprocessed_text
+        
+        st.write(f"Original text length: {len(extracted_text)} characters.")
+        st.markdown(f"""
+            <div style='background-color: #f8f9fa; border-left: 4px solid #0084ff; padding: 12px; margin-bottom: 12px; border-radius: 4px;'>
+                <div style='font-size: 12px; color: #666; font-weight: bold; margin-bottom: 8px;'>
+                    PREPROCESSED TEXT
+                </div>
+                <div style='font-size: 14px; color: #1a1a1a; line-height: 1.6;'>
+                    {preprocessed_text[:500]}{'...' if len(preprocessed_text) > 500 else ''}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        st.write(f"Preprocessed text length: {len(st.session_state.preprocessed_text)} characters.")
+        
+        if st.session_state.preprocessed_text:
+            st.subheader("2. Chunking Text...")
+            with st.spinner('Chunking text...'):
+                text_chunks = chunk_text_by_token(
+                    text=st.session_state.preprocessed_text, 
+                    _tokenizer=tokenizer,
+                    max_len=max_len,
+                    reserve_space=128,
+                    overlap_tokens=chunk_overlap_token_size
+                )
+            st.write(f"Number of text chunks created: {len(text_chunks)}")
 
-                if text_chunks:
-                    st.subheader("3. Generating Summaries for Each Chunk...")
-                    with st.expander("Summarizing..."):
+            if text_chunks:
+                st.subheader("3. Generating Summaries for Each Chunk...")
+                with st.expander("Summarizing..."):
+                    try:
                         chunk_summaries = get_summaries_for_chunks(
-                            summarizer, 
                             text_chunks,
                             min_summary_length,
-                            max_summary_length) 
-                    st.session_state.chunk_summaries = chunk_summaries
-                    st.session_state.processing_done = True
-                    st.markdown("---")
-                    st.subheader("📑 Section Summaries")
-                    
-                    # Display summaries in a professional report style
-                    for i, summary in enumerate(chunk_summaries):
-                        # Create a card-like container for each section
-                        st.markdown(f"""
-                        <div style='background-color: #f8f9fa; border-left: 4px solid #0084ff; padding: 12px; margin-bottom: 12px; border-radius: 4px;'>
-                            <div style='font-size: 12px; color: #666; font-weight: bold; margin-bottom: 8px;'>
-                                SECTION {i+1} 
-                            </div>
-                            <div style='font-size: 14px; color: #1a1a1a; line-height: 1.6;'>
-                                {summary}
-                            </div>
+                            max_summary_length
+                        )
+                    except Exception as e:
+                        st.error(f"Error generating summaries: {str(e)}")
+                        st.stop()
+                
+                st.session_state.chunk_summaries = chunk_summaries
+                st.session_state.processing_done = True
+                st.markdown("---")
+                st.subheader("📑 Section Summaries")
+                
+                # Display summaries in a professional report style
+                for i, summary in enumerate(chunk_summaries):
+                    st.markdown(f"""
+                    <div style='background-color: #f8f9fa; border-left: 4px solid #0084ff; padding: 12px; margin-bottom: 12px; border-radius: 4px;'>
+                        <div style='font-size: 12px; color: #666; font-weight: bold; margin-bottom: 8px;'>
+                            SECTION {i+1} 
                         </div>
-                        """, unsafe_allow_html=True)
+                        <div style='font-size: 14px; color: #1a1a1a; line-height: 1.6;'>
+                            {summary}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                    if chunk_summaries:
-                        st.markdown("---")
-                        st.subheader("Overall Document Summary...")
-                        full_doc_summary = " ".join(chunk_summaries)
+                if chunk_summaries:
+                    st.markdown("---")
+                    st.subheader("Overall Document Summary...")
+                    full_doc_summary = " ".join(chunk_summaries)
 
-                        if len(full_doc_summary.split()) > max_summary_length * 2:
-                            st.subheader("*Generating a more concise overall summary...*")
-                            try:
-                                # Generate a summary of all the chunk summaries combined
-                                with st.spinner('Generating concise overall summary...'):
-                                    concise_summary_list = get_summaries_for_chunks(
-                                        summarizer,
-                                        [full_doc_summary],
-                                        min_summary_length,
-                                        max_summary_length
-                                    )
-                                # Extract the actual summary text from the list
-                                if concise_summary_list and len(concise_summary_list) > 0:
-                                    final_summary = concise_summary_list[0]
-                                    # Clean up any "Summary unavailable" prefixes
-                                    if final_summary.startswith("Summary unavailable. Preview: "):
-                                        final_summary = final_summary.replace("Summary unavailable. Preview: ", "")
-                                    st.session_state.final_summary = final_summary
-                                    st.success("**Final Document Summary:**")
-                                    st.info(final_summary)
-                                else:
-                                    st.session_state.final_summary = full_doc_summary
-                                    st.warning("Could not generate a concise summary. Here's the combined summary:")
-                                    st.write(full_doc_summary)
-                            except Exception as e:
+                    if len(full_doc_summary.split()) > max_summary_length * 2:
+                        st.subheader("*Generating a more concise overall summary...*")
+                        try:
+                            with st.spinner('Generating concise overall summary...'):
+                                concise_summary_list = get_summaries_for_chunks(
+                                    [full_doc_summary],
+                                    min_summary_length,
+                                    max_summary_length
+                                )
+                            
+                            if concise_summary_list and len(concise_summary_list) > 0:
+                                final_summary = concise_summary_list[0]
+                                if final_summary.startswith("Summary unavailable. Preview: "):
+                                    final_summary = final_summary.replace("Summary unavailable. Preview: ", "")
+                                st.session_state.final_summary = final_summary
+                                st.success("**Final Document Summary:**")
+                                st.info(final_summary)
+                            else:
                                 st.session_state.final_summary = full_doc_summary
-                                st.error(f"Error generating concise overall summary: {e}")
-                                st.warning("Showing combined chunk summaries instead:")
+                                st.warning("Could not generate a concise summary. Here's the combined summary:")
                                 st.write(full_doc_summary)
-                        else:
+                        except Exception as e:
                             st.session_state.final_summary = full_doc_summary
-                            st.success("**Final Document Summary:**")
+                            st.error(f"Error generating concise overall summary: {e}")
+                            st.warning("Showing combined chunk summaries instead:")
                             st.write(full_doc_summary)
+                    else:
+                        st.session_state.final_summary = full_doc_summary
+                        st.success("**Final Document Summary:**")
+                        st.write(full_doc_summary)
 
-                        # ── Download Summary PDF Button ───────────────────────────
-                        if st.session_state.final_summary and st.session_state.chunk_summaries:
-                            st.markdown("---")
-                            st.markdown("### 📥 Download Summary Report")
-                            st.markdown(
-                                "<p style='color:#555;font-size:14px;margin-top:-8px'>"
-                                "Download a beautifully formatted PDF containing all section summaries "
-                                "and the final document summary.</p>",
-                                unsafe_allow_html=True,
-                            )
-                            with st.spinner("Preparing PDF..."):
-                                pdf_bytes = generate_summary_pdf(
+                    # Download Summary PDF Button
+                    if st.session_state.final_summary and st.session_state.chunk_summaries:
+                        st.markdown("---")
+                        st.markdown("### 📥 Download Summary Report")
+                        st.markdown(
+                            "<p style='color:#555;font-size:14px;margin-top:-8px'>"
+                            "Download a beautifully formatted PDF containing all section summaries "
+                            "and the final document summary.</p>",
+                            unsafe_allow_html=True,
+                        )
+                        with st.spinner("Preparing PDF..."):
+                            try:
+                                summary_pdf_bytes = generate_summary_pdf(
                                     chunk_summaries=st.session_state.chunk_summaries,
                                     final_summary=st.session_state.final_summary,
                                     pdf_filename=st.session_state.pdf_filename,
                                 )
-                            fname = st.session_state.pdf_filename.replace(".pdf", "") or "document"
-                            download_name = f"{fname}_summary.pdf"
-                            st.download_button(
-                                label="⬇️  Download Summary PDF",
-                                data=pdf_bytes,
-                                file_name=download_name,
-                                mime="application/pdf",
-                                use_container_width=True,
-                                type="primary",
-                            )
-                    else:
-                        st.info("No chunk summaries were generated.")
+                                fname = st.session_state.pdf_filename.replace(".pdf", "") or "document"
+                                download_name = f"{fname}_summary.pdf"
+                                st.download_button(
+                                    label="⬇️  Download Summary PDF",
+                                    data=summary_pdf_bytes,
+                                    file_name=download_name,
+                                    mime="application/pdf",
+                                    use_container_width=True,
+                                    type="primary",
+                                )
+                            except Exception as e:
+                                st.error(f"Error generating PDF: {str(e)}")
                 else:
-                    st.info("No text chunks were created.")
+                    st.info("No chunk summaries were generated.")
             else:
-                st.info("No text was extracted from the PDF.")
+                st.info("No text chunks were created.")
+        else:
+            st.info("No text was extracted from the PDF.")
     
     # Show cached results if already processed
     elif st.session_state.processing_done and st.session_state.chunk_summaries:
@@ -211,33 +233,33 @@ if uploaded_file is not None:
             st.markdown("---")
             st.markdown("### 📥 Download Summary Report")
             with st.spinner("Preparing PDF..."):
-                pdf_bytes = generate_summary_pdf(
-                    chunk_summaries=st.session_state.chunk_summaries,
-                    final_summary=st.session_state.final_summary,
-                    pdf_filename=st.session_state.pdf_filename,
-                )
-            fname = st.session_state.pdf_filename.replace(".pdf", "") or "document"
-            download_name = f"{fname}_summary.pdf"
-            st.download_button(
-                label="⬇️  Download Summary PDF",
-                data=pdf_bytes,
-                file_name=download_name,
-                mime="application/pdf",
-                use_container_width=True,
-                type="primary",
-            )
+                try:
+                    summary_pdf_bytes = generate_summary_pdf(
+                        chunk_summaries=st.session_state.chunk_summaries,
+                        final_summary=st.session_state.final_summary,
+                        pdf_filename=st.session_state.pdf_filename,
+                    )
+                    fname = st.session_state.pdf_filename.replace(".pdf", "") or "document"
+                    download_name = f"{fname}_summary.pdf"
+                    st.download_button(
+                        label="⬇️  Download Summary PDF",
+                        data=summary_pdf_bytes,
+                        file_name=download_name,
+                        mime="application/pdf",
+                        use_container_width=True,
+                        type="primary",
+                    )
+                except Exception as e:
+                    st.error(f"Error generating PDF: {str(e)}")
 else:
     st.info('Please upload a PDF to get started!')
 
+# Chat Interface
 context = st.session_state.preprocessed_text
 
 if context:
     st.markdown("---")
     st.subheader("💬 Chat with Your PDF")
-    
-    # Initialize chat history
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
     
     # Display chat history
     if st.session_state.chat_history:
@@ -260,7 +282,7 @@ if context:
             </div>
             """, unsafe_allow_html=True)
     
-    # Chat input container (ChatGPT-style)
+    # Chat input container
     user_input = st.chat_input("💭 Ask me anything about this PDF...")
     
     # Handle suggested questions
@@ -272,12 +294,10 @@ if context:
     if user_input and user_input.strip():
         with st.spinner('🤔 Thinking...'):
             try:
-                # Step 1: Get relevant context from Pinecone
+                # Get relevant context from Pinecone
                 relevant_context = query_pinecone_for_context(user_input, top_k=3)
-                
-                # Step 2: Get expanded answer (short span + detailed explanation)
+                # Get expanded answer
                 answer, confidence = get_expanded_answer(user_input, relevant_context)
-                
                 # Add to chat history
                 st.session_state.chat_history.append((user_input, answer))
                 st.rerun()
