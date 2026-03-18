@@ -1,74 +1,47 @@
 import streamlit as st
-import sys
+import os
 
 # Try to import Pinecone with error handling
 try:
-    from pinecone import Pinecone, ServerlessSpec, PodSpec
+    from pinecone import Pinecone, ServerlessSpec
 except ImportError as e:
     st.error(f"❌ Pinecone library not installed: {str(e)}")
     st.stop()
 except Exception as e:
-    # Pinecone itself is raising an exception during import
-    # This can happen on some environments - we'll defer initialization
     st.warning(f"⚠️ Pinecone import warning: {str(e)}")
-    Pinecone = None
 
-# Get API keys from Streamlit secrets (works on Cloud and local with secrets.toml)
+# Get API keys from Streamlit secrets
 PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", "")
 
 if not PINECONE_API_KEY:
     st.error("❌ PINECONE_API_KEY not found in secrets!")
     st.stop()
 
-# Create a Pinecone client instance with safer initialization
-pc = None
-index = None
-
+# Initialize Pinecone with v3 API
 try:
-    if Pinecone is not None:
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-    else:
-        st.error("❌ Pinecone client not available")
-        st.stop()
+    pc = Pinecone(api_key=PINECONE_API_KEY)
 except Exception as e:
     st.error(f"❌ Failed to initialize Pinecone: {str(e)}")
-    st.info("Try reinstalling: pip install --upgrade pinecone-client")
+    st.info("Make sure PINECONE_API_KEY is set in .streamlit/secrets.toml")
     st.stop()
 
 index_name = "pdfexplainer078"
 EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 uses 384 dimensions (FREE model)
 
-# Get or create index
+# Get or create index using Pinecone v3 API
 try:
-    if pc is None:
-        st.error("❌ Pinecone client not initialized")
-        st.stop()
+    # Check if index exists
+    existing_indexes = pc.list_indexes().names()
     
-    existing_indexes = pc.list_indexes()
-    index_exists = any(idx.name == index_name for idx in existing_indexes)
-    
-    if not index_exists:
+    if index_name not in existing_indexes:
         print(f"Creating index '{index_name}' with {EMBEDDING_DIM} dimensions...")
-        try:
-            # Try to create with ServerlessSpec (for free tier)
-            pc.create_index(
-                name=index_name,
-                dimension=EMBEDDING_DIM,
-                metric="cosine",
-                spec=ServerlessSpec(cloud="aws", region="us-east-1")
-            )
-        except Exception as serverless_err:
-            # Fallback: create with PodSpec for standard tier
-            try:
-                pc.create_index(
-                    name=index_name,
-                    dimension=EMBEDDING_DIM,
-                    metric="cosine",
-                    spec=PodSpec(environment="us-east-1")
-                )
-            except Exception as pod_err:
-                st.error(f"❌ Could not create index. ServerlessSpec error: {str(serverless_err)}, PodSpec error: {str(pod_err)}")
-                st.stop()
+        # Create index with ServerlessSpec
+        pc.create_index(
+            name=index_name,
+            dimension=EMBEDDING_DIM,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
         print(f"Index '{index_name}' created successfully!")
     
     # Get index reference

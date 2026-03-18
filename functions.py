@@ -4,7 +4,7 @@ import nltk
 import time
 import uuid
 import streamlit as st
-from init_pinecone import pc, index
+from init_pinecone import index
 from sentence_transformers import SentenceTransformer
 from fpdf import FPDF
 from datetime import datetime
