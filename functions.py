@@ -7,12 +7,13 @@ import streamlit as st
 from init_pinecone import index
 from sentence_transformers import SentenceTransformer
 from fpdf import FPDF
-from datetime import datetime
 import io
 import requests
-from typing import List, Tuple
+from typing import List
 import threading
 from collections import deque
+import tiktoken
+import hashlib
 
 # Free embedding model - works on Streamlit Cloud, no API key needed
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Free, fast, 384 dimensions
@@ -135,65 +136,42 @@ def preprocess_text(text):
     return text
 
 @st.cache_data
-def chunk_text_by_token(text, _tokenizer, max_len, reserve_space=128, overlap_tokens=40):
-    """Split text into chunks based on token count"""
+def chunk_text_with_tiktoken(text, max_tokens=500, overlap_tokens=40):
+    """
+    Smart chunking using OpenAI's tiktoken
+    Fast, accurate, and actually installs!
+    """
     if not text:
         return []
     
-    words = text.split()
-    chunks = []
-    i = 0
+    # Use GPT-4 tokenizer
+    encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 encoding
     
-    while i < len(words):
-        j = i
-        curr_token = 0
+    # Tokenize entire text
+    tokens = encoding.encode(text)
+    
+    chunks = []
+    start = 0
+    
+    while start < len(tokens):
+        # Get chunk of tokens
+        end = start + max_tokens
+        chunk_tokens = tokens[start:end]
         
-        # Find the maximum number of words that fit within token limit
-        while j < len(words):
-            candidate = " ".join(words[i:j+1])
-            token_count = len(_tokenizer.encode(candidate, add_special_tokens=False))
-            if token_count + reserve_space > max_len:
-                break
-            curr_token = token_count
-            j += 1
+        # Decode back to text
+        chunk_text = encoding.decode(chunk_tokens)
         
-        # Handle edge case where even one word is too long
-        if j == i:
-            chunk_text = " ".join(words[i:i+50])  # Take 50 words max
-            i += 50
-        else:
-            chunk_text = " ".join(words[i:j])
-            # Better overlap calculation
-            chunk_size = j - i
-            overlap_words = min(overlap_tokens // 4, chunk_size // 2)
-            i = j - overlap_words
+        # Only add if non-empty
+        if chunk_text.strip():
+            chunks.append(chunk_text.strip())
         
-        chunks.append(chunk_text)
-        
-        # Safety check to prevent infinite loops
-        if i >= len(words):
-            break
+        # Move forward with overlap
+        start = end - overlap_tokens
     
     return chunks
 
-@st.cache_resource
-def get_tokenizer_and_max_len():
-    """Get a simple word-based tokenizer for chunking"""
-    class SimpleTokenizer:
-        def encode(self, text, add_special_tokens=False):
-            # Simple word-based tokenization (~4 chars per token average)
-            return text.split()
-        
-        def __getattr__(self, name):
-            if name == "model_max_length":
-                return 1024
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-    
-    tokenizer = SimpleTokenizer()
-    max_len = 1024
-    return tokenizer, max_len
 
-def query_pinecone_for_context(user_question, top_k=10):
+def query_pinecone_for_context(user_question, top_k=5):
     """Query Pinecone for relevant context chunks"""
     try:
         # Use sentence-transformers for embeddings
@@ -334,53 +312,83 @@ def get_summary_for_text(text, min_length=50, max_length=150):
     summary = call_groq_api_with_retry(payload)
     
     if summary is None:
-        return f"Summary unavailable. Preview: {text[:100]}..."
+        return f"Summary unavailable. Preview: {text[:500]}..."
     
     return summary
 
 def batch_summarize_chunks(text_chunks: List[str], batch_size: int = 3) -> List[str]:
     """
     Summarize multiple chunks in a single API call for efficiency
-    
-    Args:
-        text_chunks: List of text chunks to summarize
-        batch_size: Number of chunks to combine per API call
-    
-    Returns:
-        List of summaries
+    GUARANTEES exact count match: len(output) == len(input)
     """
     all_summaries = []
     
     for i in range(0, len(text_chunks), batch_size):
         batch = text_chunks[i:i+batch_size]
+        batch_count = len(batch)
         
-        # Combine chunks with clear separators
-        combined_text = "\n\n---CHUNK SEPARATOR---\n\n".join(
-            [f"CHUNK {j+1}:\n{chunk}" for j, chunk in enumerate(batch)]
-        )
+        # Create numbered chunks with clear separators
+        numbered_chunks = ""
+        for j, chunk in enumerate(batch, 1):
+            numbered_chunks += f"===CHUNK {j}===\n{chunk}\n\n"
         
         payload = {
             "model": "llama-3.1-8b-instant",
             "messages": [{
                 "role": "user",
-                "content": f"""Summarize each chunk separately. Return summaries in the format:
-                    SUMMARY 1: [summary here]
-                    SUMMARY 2: [summary here]
-                    etc.
-                    {combined_text}"""
+                "content": f"""You will summarize EXACTLY {batch_count} text chunks.
+
+CRITICAL RULES:
+1. Write EXACTLY {batch_count} summaries, one for each chunk
+2. Each summary must be a SINGLE paragraph (no line breaks within)
+3. Start each summary with the marker: <<<SUMMARY X>>>
+4. Do NOT add extra paragraphs or explanations
+
+Format example:
+<<<SUMMARY 1>>> Your single paragraph summary here.
+<<<SUMMARY 2>>> Your single paragraph summary here.
+<<<SUMMARY 3>>> Your single paragraph summary here.
+
+Here are the {batch_count} chunks to summarize:
+
+{numbered_chunks}
+
+Now write EXACTLY {batch_count} summaries:"""
             }],
-            "max_tokens": 500 * len(batch)
+            "max_tokens": 500 * batch_count
         }
         
         result = call_groq_api_with_retry(payload)
         
         if result:
-            # Parse individual summaries
-            summaries = re.findall(r'SUMMARY \d+: (.+?)(?=SUMMARY \d+:|$)', result, re.DOTALL)
-            all_summaries.extend([s.strip() for s in summaries])
+            # Extract summaries using the markers
+            import re
+            summaries = re.findall(r'<<<SUMMARY \d+>>>\s*(.+?)(?=<<<SUMMARY \d+>>>|$)', result, re.DOTALL)
+            
+            # Clean and validate
+            cleaned = []
+            for s in summaries:
+                # Remove any internal line breaks
+                s = ' '.join(s.split())
+                s = s.strip()
+                if s and len(s) > 20:
+                    cleaned.append(s)
+            
+            # STRICT COUNT CHECK
+            if len(cleaned) == batch_count:
+                all_summaries.extend(cleaned)
+                st.write(f"✅ Batch {i//batch_size + 1}: {len(cleaned)}/{batch_count} summaries")
+            else:
+                # Mismatch - use fallback
+                st.warning(f"⚠️ Batch {i//batch_size + 1}: Got {len(cleaned)} summaries, expected {batch_count}. Using original text.")
+                all_summaries.extend([chunk.strip() for chunk in batch])
         else:
-            # Fallback: use chunk previews
-            all_summaries.extend([f"Preview: {chunk[:100]}..." for chunk in batch])
+            # API failed
+            st.warning(f"⚠️ Batch {i//batch_size + 1}: API failed. Using original text.")
+            all_summaries.extend([chunk.strip() for chunk in batch])
+    
+    # FINAL VALIDATION
+    st.write(f"📊 Total: {len(all_summaries)} summaries from {len(text_chunks)} chunks")
     
     return all_summaries
 
@@ -398,7 +406,7 @@ def get_summaries_for_chunks(text_chunks, min_summary_length=50, max_summary_len
     
     # Load embedding model once
     embedding_model = load_embedding_model()
-    pdf_id = f"pdf-{st.session_state.pdf_filename}-{uuid.uuid4()}"
+    pdf_id = f"pdf-{hashlib.md5(st.session_state.pdf_filename.encode()).hexdigest()}"
     st.session_state.pdf_id = pdf_id  # Store in session state for later use
     # Determine strategy based on chunk count
     num_chunks = len(text_chunks)
@@ -454,7 +462,7 @@ def get_summaries_for_chunks(text_chunks, min_summary_length=50, max_summary_len
                 
                 # Skip very short chunks
                 if chunk_length < 20:
-                    summaries.append(f"Chunk {i+1}: {chunk[:100]}..." if len(chunk) > 100 else chunk)
+                    summaries.append(f"{chunk.strip()}")
                     continue
                 
                 # Generate summary with rate limiting
@@ -477,7 +485,8 @@ def get_summaries_for_chunks(text_chunks, min_summary_length=50, max_summary_len
     
     return summaries
 
-def generate_summary_pdf(chunk_summaries, final_summary, pdf_filename="summary"):
+
+def generate_summary_pdf(chunk_summaries, pdf_filename="summary"):
     """
     Generate a clean PDF with section summaries and final summary.
     Returns PDF as bytes for Streamlit download.
@@ -534,18 +543,6 @@ def generate_summary_pdf(chunk_summaries, final_summary, pdf_filename="summary")
         pdf.set_text_color(0, 0, 0)
         pdf.multi_cell(0, 5, safe(summary), ln=True)
         pdf.ln(2)
-
-    # Final Summary
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_fill_color(30, 90, 180)
-    pdf.cell(0, 7, "  FINAL SUMMARY", fill=True, ln=True)
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(0, 0, 0)
-    pdf.multi_cell(0, 5, safe(final_summary), ln=True)
 
     # Return PDF as bytes
     pdf_bytes = bytes(pdf.output())
