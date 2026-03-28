@@ -204,7 +204,7 @@ def query_pinecone_for_context(user_question, top_k=5):
         st.error(f"Error querying Pinecone: {str(e)}")
         return ""
 
-def call_groq_api_with_retry(payload, max_retries=3):
+def call_groq_api_with_retry(payload, max_retries=5):
     """
     Call Groq API with automatic rate limiting and retry logic
     
@@ -231,29 +231,35 @@ def call_groq_api_with_retry(payload, max_retries=3):
                 return response.json()["choices"][0]["message"]["content"].strip()
             
             elif response.status_code == 429:
-                # Rate limit hit - wait longer
-                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                st.warning(f"⏳ Rate limit reached. Waiting {wait_time}s before retry...")
+                # Groq has strict Tokens-Per-Minute restrictions on the free tier.
+                # When exceeded, we need 15-60 seconds for the bucket to refill.
+                try:
+                    retry_after = float(response.headers.get("retry-after", 0))
+                    wait_time = max(retry_after, 15 * (1.5 ** attempt))
+                except:
+                    wait_time = 15 * (1.5 ** attempt)  # 15s, 22.5s, 33.7s, 50.6s
+                
+                st.warning(f"⏳ Rate limit reached. Waiting {int(wait_time)}s for tokens to refill...")
                 time.sleep(wait_time)
                 continue
             
             elif response.status_code >= 500:
                 # Server error - retry
                 if attempt < max_retries - 1:
-                    time.sleep(1)
+                    time.sleep(2)
                     continue
                 else:
                     return None
             
             else:
                 # Other errors - don't retry
-                st.error(f"API Error: {response.status_code}")
+                st.error(f"API Error {response.status_code}: {response.text}")
                 return None
                 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
                 st.warning("⏳ Request timed out, retrying...")
-                time.sleep(1)
+                time.sleep(2)
                 continue
             else:
                 return None
